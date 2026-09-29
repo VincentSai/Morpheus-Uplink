@@ -91,12 +91,13 @@ type Catalog struct {
 	bidsURL string // GATEWAY_BIDS_URL companion feed; not merged into LowestBid
 	client  *http.Client
 
-	mu        sync.Mutex
-	models    []Model
-	byName    map[string]string // lowercase name -> id
-	byID      map[string]string // lowercase id -> display name
-	fetchedAt time.Time
-	ttl       time.Duration
+	mu          sync.Mutex
+	models      []Model
+	byName      map[string]string   // lowercase name -> id
+	byID        map[string]string   // lowercase id -> display name
+	twinsByName map[string][]string // lowercase name -> all candidate model ids
+	fetchedAt   time.Time
+	ttl         time.Duration
 }
 
 func New(url string) *Catalog {
@@ -132,15 +133,77 @@ func (c *Catalog) refresh() error {
 	}
 	byName := make(map[string]string, len(file.Models))
 	byID := make(map[string]string, len(file.Models))
+	twinsByName := make(map[string][]string, len(file.Models))
+	bestModelByName := make(map[string]Model, len(file.Models))
+
 	for _, m := range file.Models {
-		byName[strings.ToLower(m.Name)] = m.ID
-		byID[strings.ToLower(m.ID)] = m.Name
+		nameKey := strings.ToLower(m.Name)
+		idKey := strings.ToLower(m.ID)
+		byID[idKey] = m.Name
+		twinsByName[nameKey] = append(twinsByName[nameKey], m.ID)
+
+		if existing, exists := bestModelByName[nameKey]; !exists {
+			bestModelByName[nameKey] = m
+			byName[nameKey] = m.ID
+		} else if isBetterModel(m, existing) {
+			bestModelByName[nameKey] = m
+			byName[nameKey] = m.ID
+		}
 	}
 	c.models = file.Models
 	c.byName = byName
 	c.byID = byID
+	c.twinsByName = twinsByName
 	c.fetchedAt = time.Now()
 	return nil
+}
+
+// isBetterModel returns true if candidate should be chosen over current for resolving
+// duplicate model names. It prioritizes healthy bids, lower price per second, and
+// falls back to deterministic ID comparison to prevent feed-order randomness.
+func isBetterModel(candidate, current Model) bool {
+	candBid, candOk := candidate.LowestBid()
+	currBid, currOk := current.LowestBid()
+
+	if candOk && !currOk {
+		return true
+	}
+	if !candOk && currOk {
+		return false
+	}
+	if !candOk && !currOk {
+		return strings.ToLower(candidate.ID) < strings.ToLower(current.ID)
+	}
+
+	candHealthy := candBid.Status == "" || strings.EqualFold(candBid.Status, "healthy")
+	currHealthy := currBid.Status == "" || strings.EqualFold(currBid.Status, "healthy")
+
+	if candHealthy && !currHealthy {
+		return true
+	}
+	if !candHealthy && currHealthy {
+		return false
+	}
+
+	candPPS := candidate.LowestPricePerSecondWei()
+	currPPS := current.LowestPricePerSecondWei()
+
+	if candPPS != nil && currPPS != nil {
+		cmp := candPPS.Cmp(currPPS)
+		if cmp < 0 {
+			return true
+		}
+		if cmp > 0 {
+			return false
+		}
+	} else if candPPS != nil && currPPS == nil {
+		return true
+	} else if candPPS == nil && currPPS != nil {
+		return false
+	}
+
+	// Tie-break deterministically by ID
+	return strings.ToLower(candidate.ID) < strings.ToLower(current.ID)
 }
 
 func (c *Catalog) ensureFresh() error {
@@ -193,3 +256,20 @@ func (c *Catalog) NameByID(id string) string {
 	}
 	return c.byID[strings.ToLower(id)]
 }
+
+// TwinsByName returns all candidate blockchain model IDs registered under the given display name.
+func (c *Catalog) TwinsByName(name string) []string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if err := c.ensureFresh(); err != nil {
+		return nil
+	}
+	ids := c.twinsByName[strings.ToLower(name)]
+	if len(ids) == 0 {
+		return nil
+	}
+	out := make([]string, len(ids))
+	copy(out, ids)
+	return out
+}
+
